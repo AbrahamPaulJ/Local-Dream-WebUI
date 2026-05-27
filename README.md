@@ -15,6 +15,7 @@ A Flask web UI for the [Local Dream](https://github.com/xororz/local-dream) Andr
 - **Details panel** — shows Steps, CFG, Size, Seed, Scheduler, and generation time after each run
 - **Session persistence** — uploaded image, mask, and crop region survive page reloads (cleared when tab closes)
 - **Multi-language** — English and Chinese UI, toggle in the top nav bar
+- **Parameter presets** — save and load prompt, negative prompt, size, steps, scheduler, CFG, and Karras settings
 - **Configurable backend** — set a custom Local Dream IP/port when running on different machines
 - **Real-time connectivity** — health check auto-runs on URL changes; instant feedback on backend status
 - **Apple-inspired design** — light parchment canvas, white utility cards, dark output tile, pill buttons, Action Blue accent

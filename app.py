@@ -2,30 +2,113 @@ import base64
 import io
 import json
 import os
+from pathlib import Path
 
 import requests
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 from PIL import Image
 
+from sse import EVENT_HANDLERS, parse_sse, passthrough
+
 app = Flask(__name__)
-LOCAL_DREAM_URL = "http://127.0.0.1:8081"
+DEFAULT_LD_URL = "http://127.0.0.1:8081"
+
+
+def _parse_netloc(url: str) -> str:
+    """从 URL 中提取 netloc（host:port）。
+
+    不引入 urllib，纯字符串操作；输入非 http(s):// 形式时返回 ""。
+    """
+    if "://" not in url:
+        return ""
+    _, _, rest = url.partition("://")
+    host_port, _, _ = rest.partition("/")
+    return host_port.strip()
+
+
+def _load_allowed_hosts() -> frozenset[str]:
+    """从 LD_ALLOWED_HOSTS 环境变量读取 trusted-host 白名单。
+
+    格式：逗号分隔的 host:port 列表，例如 "127.0.0.1:8081,localhost:8081"。
+    空 / 未设置 → 返回空 frozenset，表示不限制（向后兼容）。
+    """
+    raw = os.environ.get("LD_ALLOWED_HOSTS", "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(h.strip() for h in raw.split(",") if h.strip())
+
+
+def resolve_ld_url(override) -> str:
+    """解析 Local Dream URL：override 优先，allowlist 校验后回落到 DEFAULT_LD_URL。
+
+    行为：
+    - override 为 None / 非字符串 / 空字符串 / 纯空白 → 返回 DEFAULT_LD_URL
+    - override 为合法字符串 + allowlist 未配置（env 空）→ 返回 override
+    - override 为合法字符串 + allowlist 已配置 + netloc 在白名单 → 返回 override
+    - override 为合法字符串 + allowlist 已配置 + netloc 不在白名单 → 回落 DEFAULT_LD_URL
+
+    安全语义：白名单是"未授权后端的隐形拒绝"——不抛错、不返回 403，避免
+    攻击者通过错误响应探测后端存在性。前端 UI 应提示用户 override 失效。
+
+    比内联 `or DEFAULT_LD_URL` 更稳健：原写法对非空但非字符串的值（如 0、[]、{}）
+    会跳过回落；本函数会识别并安全降级。
+    """
+    if not isinstance(override, str):
+        return DEFAULT_LD_URL
+    stripped = override.strip()
+    if not stripped:
+        return DEFAULT_LD_URL
+
+    allowed = _load_allowed_hosts()
+    if not allowed:
+        return stripped  # 未配置白名单 = 不限制
+
+    netloc = _parse_netloc(stripped)
+    if netloc and netloc in allowed:
+        return stripped
+    return DEFAULT_LD_URL  # 拒绝：netloc 不在白名单
+
+
+class HFAutomask:
+    """Hugging Face Router 衣物分割适配器。
+
+    封装对 `mattmdjaga/segformer_b2_clothes` 模型的调用。token、endpoint、
+    超时都是命名属性；新增模型或换 endpoint 只需继承或修改常量，路由不变。
+
+    后续若要加多模型或多 endpoint，演化为：
+      - 子类化（HFAutomaskClothes / HFAutomaskDepth）
+      - 或在 __init__ 接收 model 字符串作为参数
+    当前只服务一个模型 / endpoint，保持最小抽象。
+    """
+
+    ENDPOINT = "https://router.huggingface.co/hf-inference/models/mattmdjaga/segformer_b2_clothes"
+
+    def __init__(self, token: str, timeout: int = 60):
+        self._headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "image/png",
+        }
+        self._timeout = timeout
+
+    def segment(self, png_bytes: bytes) -> dict:
+        """提交 PNG 字节，返回分割结果 JSON。抛错由调用方决定如何转 HTTP 错误。"""
+        resp = requests.post(
+            self.ENDPOINT,
+            headers=self._headers,
+            data=png_bytes,
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
 
 # Load HF_TOKEN from .env if present (not committed)
-_env = os.path.join(os.path.dirname(__file__), ".env")
-if os.path.exists(_env):
-    with open(_env) as _f:
-        for _l in _f:
-            if "=" in _l and not _l.startswith("#"):
-                _k, _v = _l.strip().split("=", 1)
-                os.environ.setdefault(_k.strip(), _v.strip())
-
-
-def raw_rgb_to_png_b64(data):
-    raw = base64.b64decode(data["image"])
-    img = Image.frombytes("RGB", (data["width"], data["height"]), raw)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        if "=" in _line and not _line.startswith("#"):
+            _k, _v = _line.strip().split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 
 @app.route("/")
@@ -35,8 +118,9 @@ def index():
 
 @app.route("/health")
 def health():
+    url = resolve_ld_url(request.args.get("url"))
     try:
-        r = requests.get(f"{LOCAL_DREAM_URL}/", timeout=2)
+        requests.get(f"{url}/", timeout=2)
         return jsonify({"ok": True})
     except Exception:
         return jsonify({"ok": False, "error": "Local Dream not reachable"}), 503
@@ -46,17 +130,97 @@ def health():
 def automask():
     body = request.json
     token = body.get("token", "").strip() or os.environ.get("HF_TOKEN", "")
-    img_bytes = base64.b64decode(body.get("image", ""))
     try:
-        resp = requests.post(
-            "https://router.huggingface.co/hf-inference/models/mattmdjaga/segformer_b2_clothes",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "image/png"},
-            data=img_bytes,
-            timeout=60,
+        result = HFAutomask(token).segment(base64.b64decode(body.get("image", "")))
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/tokenize", methods=["POST"])
+def tokenize():
+    """代理 POST /tokenize → Local Dream 的 /tokenize 端点。
+
+    接受 JSON body：{"prompt": "text"}
+    返回 token 计数：{"count": n, "max_length": 77, "overflow_offset": ...}
+    """
+    url = resolve_ld_url(request.json.get("local_dream_url", None) if request.json else None)
+    try:
+        body = request.json or {}
+        body.pop("local_dream_url", None)
+        r = requests.post(f"{url}/tokenize", json=body, timeout=10)
+        return jsonify(r.json()), r.status_code
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Cannot connect to Local Dream"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/upscale", methods=["POST"])
+def upscale():
+    """代理 POST /upscale → Local Dream 的 /upscale 端点。
+
+    接受两种输入格式：
+    - JSON body: {"image": "base64_png", "width": N, "height": N, "upscaler_path": "...", ...}
+    - multipart/form-data: image file + width/height/upscaler_path 表单字段
+
+    转发后返回 JPEG 二进制图片。
+    """
+    ld_override = (
+        request.json.get("local_dream_url", None)
+        if request.is_json
+        else request.form.get("local_dream_url", None)
+    )
+    url = resolve_ld_url(ld_override)
+    try:
+        if request.is_json:
+            body = request.json
+            img_b64 = body.get("image", "")
+            if not img_b64:
+                return jsonify({"error": "Missing image"}), 400
+            width = int(body.get("width", 512))
+            height = int(body.get("height", 512))
+            upscaler_path = body.get("upscaler_path", "")
+            use_opencl = body.get("use_opencl", False)
+            # 解码 base64 PNG → raw RGB 字节
+            png_bytes = base64.b64decode(img_b64)
+            img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            img_bytes = img.tobytes()
+            width, height = img.size
+        else:
+            image_file = request.files.get("image")
+            if not image_file:
+                return jsonify({"error": "Missing image file"}), 400
+            img_bytes = image_file.read()
+            width = int(request.form.get("width", 512))
+            height = int(request.form.get("height", 512))
+            upscaler_path = request.form.get("upscaler_path", "")
+            use_opencl = request.form.get("use_opencl", "false").lower() in ("true", "1")
+
+        if not upscaler_path:
+            return jsonify({"error": "Missing upscaler_path"}), 400
+
+        headers = {
+            "X-Image-Width": str(width),
+            "X-Image-Height": str(height),
+            "X-Upscaler-Path": upscaler_path,
+            "X-Use-OpenCL": "true" if use_opencl else "false",
+        }
+        r = requests.post(f"{url}/upscale", data=img_bytes, headers=headers, timeout=300)
+
+        out_w = r.headers.get("X-Output-Width", str(width * 4))
+        out_h = r.headers.get("X-Output-Height", str(height * 4))
+
+        resp = Response(r.content, mimetype=r.headers.get("Content-Type", "image/jpeg"))
+        resp.headers["X-Output-Width"] = out_w
+        resp.headers["X-Output-Height"] = out_h
+        resp.headers["X-Duration-Ms"] = r.headers.get("X-Duration-Ms", "0")
+        resp.headers["Access-Control-Expose-Headers"] = (
+            "X-Output-Width,X-Output-Height,X-Duration-Ms"
         )
-        if resp.status_code != 200:
-            return jsonify({"error": resp.text}), 502
-        return jsonify(resp.json())
+        return resp
+    except requests.exceptions.ConnectionError:
+        return jsonify({"error": "Cannot connect to Local Dream"}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
@@ -66,41 +230,33 @@ def generate():
     payload = request.json
 
     def stream():
+        ld_url = resolve_ld_url(payload.pop("local_dream_url", None))
         try:
             with requests.post(
-                f"{LOCAL_DREAM_URL}/generate",
+                f"{ld_url}/generate",
                 json=payload,
                 stream=True,
                 timeout=300,
             ) as r:
-                event_type = None
-                for raw_line in r.iter_lines():
-                    if not raw_line:
-                        event_type = None
+                for event in parse_sse(r.iter_lines()):
+                    if event.data == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        return
+                    handler = EVENT_HANDLERS.get(event.type, passthrough)
+                    new_data = handler(event.data)
+                    if new_data is None:
                         continue
-                    line = raw_line.decode()
-                    if line.startswith("event:"):
-                        event_type = line[6:].strip()
-                        yield line + "\n"
-                    elif line.startswith("data:"):
-                        data_str = line[5:].strip()
-                        if data_str == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            return
-                        if event_type == "complete":
-                            try:
-                                data = json.loads(data_str)
-                                data["png_image"] = raw_rgb_to_png_b64(data)
-                                del data["image"]
-                                yield f"data: {json.dumps(data)}\n\n"
-                            except Exception as e:
-                                yield f"data: {json.dumps({'type':'error','error':str(e)})}\n\n"
-                        else:
-                            yield f"data: {data_str}\n\n"
-                    else:
-                        yield line + "\n"
+                    if event.type:
+                        yield f"event: {event.type}\n"
+                    yield f"data: {new_data}\n\n"
         except requests.exceptions.ConnectionError:
-            yield "data: " + json.dumps({"type": "error", "error": "Cannot connect to Local Dream. Is it running?"}) + "\n\n"
+            yield (
+                "data: "
+                + json.dumps(
+                    {"type": "error", "error": "Cannot connect to Local Dream. Is it running?"}
+                )
+                + "\n\n"
+            )
         except Exception as e:
             yield "data: " + json.dumps({"type": "error", "error": str(e)}) + "\n\n"
 

@@ -1,3 +1,19 @@
 __pycache__/
 *.pyc
+*.pyo
 .env
+.venv/
+.codegraph/
+.superpowers/
+.DS_Store
+.worktrees/
+docs/
+
+# Runtime artifacts
+*.heapsnapshot
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
